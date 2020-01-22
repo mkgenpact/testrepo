@@ -1,1 +1,748 @@
 test
+dfdfd  
+var fs = require('fs');
+var registrationSheet = "REGISTRATION";
+var TSSheet = "TIMESHEET";
+var mysql = require('mysql');
+var emailer = require('./emailer');
+var getConfig = require('./common/config');
+var excel = require('./common/excel-utils');
+var xlstojson = require("xls-to-json-lc");
+var xlsxtojson = require("xlsx-to-json-lc");
+//var request = require('request'); 
+var serviceMthod =require('./serviceMethods');
+var multer  = require('multer');
+var async = require('async');
+var excelbuilder = require('msexcel-builder');
+
+
+//file upload multer setting start
+ var storage = multer.diskStorage({ //multers disk storage settings
+         destination: function (req, file, cb) {
+             cb(null, 'uploads/')
+         },
+         filename: function (req, file, cb) {
+             var datetimestamp = Date.now();
+             cb(null, file.originalname);
+         }
+     });
+
+ var upload = multer({ //multer settings
+                     storage: storage
+                 }).single('file');
+
+/*
+   we got the situation where we can not install the my sql so
+   i am replcing the logic to save the data into json file instead of my sql
+   as this will make this project partially independent.
+*/
+// this is base path where all the json file will be stored
+// do not store any other file accept json file
+// and do not try to play with this files as this is our data files 
+// if deleted , we will loose all the data
+let basePath = 'app/db/';
+
+module.exports = function(app) {
+
+	app.post('/api/config', function(req, res) {
+		var response = { config: [], status: '' };
+		var config = getConfig();
+		response.config = config;
+		response.status = 'success';
+		res.send(response);
+	});
+
+	app.post('/api/authenticate', function(req, res) {
+		var user = req.body.ohrId;
+		var pass = req.body.pass;
+		var type = req.body.userType;
+		var response = createRes();
+		var empDetails;
+
+		try{
+			if(type == 0){
+			// employee login
+			let rawData = fs.readFileSync(basePath+user+".json");
+		    var empDetailObj = JSON.parse(rawData);
+			    empDetails = empDetailObj.empDetails;
+			}else if(type == 1){
+				// admin login
+				let rawData = fs.readFileSync(basePath+user+".json");
+				empDetails = JSON.parse(rawData);
+			}
+			let authenticate = false;
+			if(empDetails.ohrId == user && empDetails.pass == pass){
+				console.log("USER HAS BEEN Succesfully Authenticated");
+				authenticate = true;
+			}
+			if(!authenticate){
+				var response = createRes();
+				response.status = 'FAIL';
+				response.err = 'User `'+user +'` not registered' ;
+			}else{
+				var response = empDetails;
+				response.type = type;
+				response.status = 'success';
+				
+			}
+
+		} catch(err) {
+			response.status = 'FAIL';
+			response.err = 'error has occured . no user found , contact to admin ';
+			console.log(err);
+		}
+		res.send(response);
+	});
+	
+	app.post('/api/wdays', function(req, res) {
+		var month = req.body.month.id;
+		var ohrId = req.body.ohrId;
+		var year =  req.body.year;
+		console.log("month==="+month);
+		console.log("year ==" +year);
+
+		let rawData = fs.readFileSync(basePath+ohrId+".json");
+		var empDetailObj = JSON.parse(rawData);
+		var empTsExist;
+		for(var i= 0; i< empDetailObj.timesheets.length; i++){
+			empTs = empDetailObj.timesheets[i];
+			if(empTs.ohrId === ohrId  && empTs.year === year && empTs.month.id === month) {
+				empTsExist =  empTs;
+				break;
+			}
+		}
+		var response ={};
+		if(empTsExist){
+			response = empTsExist
+			response.status = 'EXIST';
+			response.err = 'Data Already exisits for '+req.body.month.name;
+			res.send(response);
+
+		}else{
+			response.status ='success';
+			res.send(response);
+		}
+	});
+
+
+	app.post('/api/update/emp', function(req, res) {
+		console.log("===== update emp details====");
+		var response = createRes();
+		var model = req.body;
+		console.log(model);
+
+		try{
+			// read the emp data
+			let rawData = fs.readFileSync(basePath+model.ohrId+".json");
+			var empDetailObj = JSON.parse(rawData);
+			empDetails = empDetailObj.empDetails;
+			// update the data
+			// currently we will update the only applicable data
+			// will only check the name, team, email, onboarding date, offboarding date and location and status
+			if(model.name && empDetails.name != model.name){
+				// name has been updated
+				empDetails.name = model.name;
+			}
+			if(model.email && empDetails.email != model.email){
+				empDetails.email = model.email
+			}
+			if(model.startDt && empDetails.startDt  != model.startDt){
+				empDetails.startDt = model.startDt;
+			}
+			if(empDetails.endDt  != model.endDt){
+				empDetails.endDt = model.endDt;
+			}
+			if(empDetails.active != model.active){
+				empDetails.active = model.active;
+			}
+			if( model.team && empDetails.team  != model.team){
+				empDetails.team = model.team;
+			}
+			if(model.contact && empDetails.contactMobile != mode.contact){
+				empDetails.contactMobile = mode.contact;
+			}
+			console.log("update emp object : " + JSON.stringify(empDetails));
+			// saving the data back to file in json format
+			let jsonObj = JSON.stringify(empDetailObj,null, module.exports.spaces);
+			fs.writeFileSync(basePath+model.ohrId+".json", jsonObj);
+			response.status = 'success';
+			console.log("successfully updated");
+		}catch(err){
+			response.err = 'error has occured while deactivating the user :' +err;
+			response.status = 'FAIL';
+			console.log(err);
+		}
+		res.send(response);
+	});
+	
+	app.post('/api/remove/emp', function(req, res) {
+		console.log("== emp deactivate processing ====");
+		var response = createRes();
+		var model = req.body;
+		// remove emp means soft delete 
+		// so we will set his/her active status as false(0)
+		// get the emp file 
+		// and update the status to 0
+		try{
+			// read the emp data
+			let rawData = fs.readFileSync(basePath+model.ohrId+".json");
+			var empDetailObj = JSON.parse(rawData);
+			empDetails = empDetailObj.empDetails;
+			// set the status to 0
+			empDetails.active =0;
+			// saving the data back to file in json format
+			let jsonObj = JSON.stringify(empDetailObj,null, module.exports.spaces);
+			fs.writeFileSync(basePath+model.ohrId+".json", jsonObj);
+			response.status = 'success';
+			console.log("successfully deactivated");
+		}catch(err){
+			response.err = 'error has occured while deactivating the user :' +err;
+			response.status = 'FAIL';
+			console.log(err);
+		}
+		res.send(response);
+	});
+	
+	app.post('/api/reminder', function(req, res) {
+		var response = createRes();
+		var model = req.body;
+
+		response.status = 'success';
+		var replaceModel = {};
+		replaceModel['R_FULLNAME'] = model.name;
+		emailer.sendMail(model.email,'','', 'Reminder - Timesheet report ', 'reminder', replaceModel);
+		res.send(response);
+	});
+
+	app.post('/api/resetPasswordEmail',function(req,res){
+		var response =createRes();
+		var model =req.body;
+
+		var replaceModel = {};
+		replaceModel['OHRID']=model.ohrId;
+
+		try{
+			// read the emp data
+			let rawData = fs.readFileSync(basePath+model.ohrId+".json");
+			var empDetailObj = JSON.parse(rawData);
+			empDetails = empDetailObj.empDetails;
+			response.status = 'success';
+			replaceModel['PASSWORD'] =empDetails.pass;
+			emailer.sendMail(model.email,'','', 'Reset Password Email', 'passwordEmail', replaceModel);
+
+		}catch(err){
+			response.status = 'FAIL';
+			response.err = "Error has occurred , please contact to application admin "+err;
+			console.log(err);
+		}
+		res.send(response);
+	});
+
+	app.get('/api/viewAllTimesheet',function(req,res){
+		var response =createTSRes();
+		response.status = 'FAIL';
+	    response.err = "this function is not yet supported";
+		res.send(response);
+	});
+	
+	
+	app.post('/api/register/emp', function(req, res) {
+		console.log('New employee registration is in process....');
+		var response = createRes();
+		var model = req.body;
+		var config = getConfig();
+		model.active =1;
+		var emp = {
+			empDetails : model,
+			timesheets : []
+		}
+		try{
+			let data = JSON.stringify(emp,null, module.exports.spaces);
+			fs.writeFileSync(basePath+model.ohrId+".json", data);
+			console.log('Succesfully created the row: ', data);
+			response.status = 'success';
+			var replaceModel = {};
+			replaceModel['R_OHRID'] = model.ohrId;
+			replaceModel['R_FULLNAME'] = model.name;
+			replaceModel['R_LOCATION'] = model.location;
+			replaceModel['R_TEAM'] = model.team;
+			emailer.sendMail(model.email,config.adminEmail,'', 'Registration Complete - ' + model.name, 'register', replaceModel);
+		}catch(err){
+			response.status = 'FAIL';
+			response.err = "Error has occurred , please contact to application admin "+err;
+			console.log(err);
+		}
+		res.send(response);
+		
+	});
+	app.post('/api/register/admin',function(req , res){
+		var response = createRes();
+		var model = req.body;
+		var config = getConfig();
+		model.active =1;
+		var admin = model;
+		try{
+			let data = JSON.stringify(admin,null, module.exports.spaces);
+			fs.writeFileSync(basePath+model.ohrId+".json", data);
+			console.log('Succesfully created the admin : ', data);
+			response.status = 'success';
+		}catch(err){
+			response.status = 'FAIL';
+			response.err = "Error has occurred , please contact to application admin "+err;
+			console.log(err);
+		}
+		res.send(response);
+	});
+
+
+	app.post('/api/register', function(req, res) {
+
+		console.log('New employee registration is in process....');
+		var response = createRes();
+		var model = req.body;
+		var config = getConfig();
+		model.active =1;
+		var emp = {
+			empDetails : model,
+			timesheets : []
+		}
+		try{
+			let data = JSON.stringify(emp,null, module.exports.spaces);
+			fs.writeFileSync(basePath+model.ohrId+".json", data);
+			console.log('Succesfully created the row: ', data);
+			response.status = 'success';
+			var replaceModel = {};
+			replaceModel['R_OHRID'] = model.ohrId;
+			replaceModel['R_FULLNAME'] = model.name;
+			replaceModel['R_LOCATION'] = model.location;
+			replaceModel['R_TEAM'] = model.team;
+			emailer.sendMail(model.email,config.adminEmail,'', 'Registration Complete - ' + model.name, 'register', replaceModel);
+		}catch(err){
+			response.status = 'FAIL';
+			response.err = "Error has occurred , please contact to application admin "+err;
+			console.log(err);
+		}
+		res.send(response);
+
+	});
+	
+	app.post('/api/create', function(req, res) {
+		var response = createRes();
+		var model = req.body;
+		model.lstUpdDt = new Date();
+		try{
+			// load all the existing ts to update with new one 
+			let rawData = fs.readFileSync(basePath+model.ohrId+".json",'utf8');
+			var empDetailObj = JSON.parse(rawData);
+			empDetailObj.timesheets.push(model);
+
+			// write the data into the file
+			// each emp has seperate json file to update the timesheet 
+			// so there is no concurrent modificatin on file
+
+			let data = JSON.stringify(empDetailObj,null, module.exports.spaces);
+			fs.writeFileSync(basePath+model.ohrId+".json", data);
+			console.log('timesheet has bee inserted by  '+model.name+'-');
+			response.status = 'success';
+		}catch(err){
+			response.status = 'FAIL';
+			response.err = 'Error has occured, please contact to application admin' +err;
+			console.log(err);
+		}
+		res.send(response);
+	});
+	
+	app.post('/api/update/timesheet', function(req, res) {
+		var response = createRes();
+		var model = req.body;
+		var year =  model.year;
+		var month = model.month.id;
+		var ohrId = model.ohrId;
+		var response = createTSRes();
+		try{
+			let rawData = fs.readFileSync(basePath+ohrId+".json",'utf8');
+			var empDetailObj = JSON.parse(rawData);
+			var existingTs;
+			for(var i= 0; i< empDetailObj.timesheets.length; i++){
+				empTs = empDetailObj.timesheets[i];
+				if(empTs.ohrId === ohrId  && empTs.year === year && empTs.month.id === month) {
+					existingTs =  empTs;
+					break;
+				}
+			}
+			if(existingTs){
+				existingTs.clientDays = model.clientDays;
+				existingTs.genpactDays = model.genpactDays;
+				existingTs.leaveTaken = model.leaveTaken;
+
+				let JsonData = JSON.stringify(empDetailObj,null, module.exports.spaces);
+				fs.writeFileSync(basePath+model.ohrId+".json", JsonData);
+				response.status = 'success';
+			}
+		}catch(err){
+			response.status = 'FAIL';
+			response.err = 'Error has occured while updating the timesheet, please contact to application admin' +err;
+			console.log(err);
+		}
+		res.send(response);
+	});
+	
+	app.post('/api/empTSdata', function(req, res) {
+		var ohrId = req.body.ohrId;
+		var response = createRes();
+		try{
+			let rawData = fs.readFileSync(basePath+ohrId+".json");
+			var empDetailObj = JSON.parse(rawData);
+			var timesheets = empDetailObj.timesheets;
+			if(!timesheets) {
+				response.err = 'No timesheet exit';
+				res.send(response);
+			}
+			response.data = timesheets;
+			response.status = 'success';
+		}catch(err){
+			response.status = 'FAIL';
+			response.err = 'Error has occured while loading the timesheet, please contact to application admin' +err;
+		}
+		res.send(response);
+		
+	});
+
+	app.post('/api/allempdata' , function(req, res){
+		console.log("loading all employee details is in progress....................")
+		var response = [];
+
+		fs.readdir(basePath , function(err, jsonFiles){
+			if(err){
+				response.status = 'FAIL';
+				response.err = 'error has occured while loading the all the employee data' +err;
+				console.log(err);
+				res.send(response);
+			}
+			console.log(jsonFiles);
+			if(jsonFiles == undefined || jsonFiles.length == 0){
+				console.log("no files in the directory :" + basePath);
+				response.status = 'FAIL';
+				response.err = "no files in the directory :" + basePath;
+				res.send(response);
+			}
+			for (var i=0; i<jsonFiles.length; i++) {
+				// read the file one by one and push the data only for selected year and month
+				let empJson = fs.readFileSync(basePath+jsonFiles[i]);
+				var empObj = JSON.parse(empJson);
+				var empDt = empObj.empDetails;
+				if(empDt == undefined || empDt == null){
+					continue;
+				}
+				response.push(empDt);
+   			 }
+   			 console.log("loading is completed")
+   			 res.send(response);
+
+		});
+
+	});
+	
+	
+	app.post('/api/monthdata', function(req, res) {
+		console.log('Going to execute query1 ');
+		var month = req.body.month;
+		var year = req.body.year;
+		var response = createTSRes();
+		console.log('laod all the json files');
+		// laod all the json files and filter the data by month and year
+		fs.readdir(basePath , function(err, jsonFiles){
+			if(err){
+				response.status = 'FAIL';
+				response.err = 'error has occured while loading the timesheet' +err;
+				console.log(err);
+				res.send(response);
+			}
+			console.log(jsonFiles);
+			if(jsonFiles == undefined || jsonFiles.length == 0){
+				console.log("no files in the directory :" + basePath);
+				response.status = 'FAIL';
+				response.err = "no files in the directory :" + basePath;
+				res.send(response);
+			}
+			for (var i=0; i<jsonFiles.length; i++) {
+				// read the file one by one and push the data only for selected year and month
+				let empJson = fs.readFileSync(basePath+jsonFiles[i]);
+				var empObj = JSON.parse(empJson);
+				var empTs = empObj.timesheets;
+				if(empTs == undefined || empTs.length ==0){
+					continue;
+				}
+				for(var j=0; j<empTs.length; j++){
+					var ts = empTs[j];
+					if(ts.year == year && ts.month.id == month){
+						response.data.push(ts);
+					}
+				}
+   			 }
+   			 response.status = 'success';
+   			 res.send(response);
+		});
+
+	});
+	
+	app.post('/api/email', function(req, res) {
+		var response = createRes();
+		var model = req.body;
+		var config = getConfig();
+		var to 	= config.scheduler.to;
+		var cc 	= config.scheduler.cc;
+		var bcc = config.scheduler.bcc;
+		
+		var subject = config.scheduler.subject;
+		var template = config.scheduler.remindTemplate;
+		var replaceModel = {};
+		console.log('reminder email for ' + model.eMonth.name);
+		replaceModel['MONTH'] =model.eMonth.name;
+		replaceModel['HOSTNAME'] =config.applicationEnv.hostName;
+		emailer.sendMail(to, cc, bcc, subject, template, replaceModel);
+		response.status = 'success';
+		res.send(response);
+	});
+
+	app.post('/api/sendPMOToBackendUpdate', function(req, res){
+		var backendTsData = req.body;
+		console.log(backendTsData);
+		var fileName = "TSC-"+backendTsData.ohrId+"-"+Date.now();
+
+		// Create a new workbook file in current working-path 
+		  var workbook = excelbuilder.createWorkbook('reports/', fileName+".xlsx");
+		  //calculate the row and column
+		  var row = backendTsData.tsData.length +1;
+		  // Create a new worksheet with 10 columns and 12 rows 
+		  var sheet1 = workbook.createSheet('sheet1',6,row);
+		  //sheet.set(column,row,date)
+		  //set the header
+		  sheet1.set(1,1,"Employee ID");
+		  sheet1.set(2,1,"Date");
+		  sheet1.set(3,1,"Expenditure Type");
+		  sheet1.set(4,1,"Project Number");
+		  sheet1.set(5,1,"Task Detail");
+		  sheet1.set(6,1,"Hour");
+		  sheet1.width(1, 15);
+		  sheet1.width(2, 15);
+		  sheet1.width(3, 15);
+		  sheet1.width(4, 15);
+		  sheet1.width(5, 15);
+		  sheet1.width(6, 15);
+         // sheet1.border(3, 1, {left:'medium',top:'medium',right:'thin',bottom:'medium'
+        var counter=0;
+		for(var i =2 ;i<=row; i++){
+		  	 sheet1.set(1,i,backendTsData.tsData[counter].ohrId);
+			 sheet1.set(2,i,backendTsData.tsData[counter].date);
+			 sheet1.set(3,i,backendTsData.tsData[counter].expenditureType);
+			 sheet1.set(4,i,backendTsData.tsData[counter].projectCode);
+			 sheet1.set(5,i,backendTsData.tsData[counter].taskDetail);
+			 sheet1.set(6,i,backendTsData.tsData[counter].hour);
+			 counter++;
+		  }
+		  // Save it 
+		 workbook.save(function(err){
+		 	var response = createRes();
+ 				if (err){
+ 					response.status = 'FAIL';
+ 					console.log(err);
+ 					 res.send(response);
+ 				}
+    			else{
+                 console.log('congratulations, your workbook created');
+		          response.status = 'success';
+		          if(backendTsData.action == 'sendtopmo'){
+		          	var config = getConfig();
+		          	var to 	= config.timesheetTemplate.pmoEmail + ";" +backendTsData.email;
+					var cc 	= config.timesheetTemplate.cc;
+					var bcc = config.timesheetTemplate.bcc;
+					var subject = 'Genpact Missing timesheet || ' +backendTsData.ohrId;
+					var template = 'TSCBackendUpdt';
+					var replaceModel = {};
+					replaceModel['ADMINNAME'] = backendTsData.userName;
+					emailer.sendMailWithAttachment(backendTsData.email,to, cc, bcc, subject, template, replaceModel, fileName);
+		          	res.send(response);
+		          }else{
+		          	res.setHeader('Content-disposition', 'attachment; filename= '+fileName+".xlsx");
+		         	res.setHeader('Content-type', 'application/vnd.ms-excel');
+		         	var fileToSend = fs.readFileSync('reports/'+fileName+".xlsx");
+		         	res.send(fileToSend);
+		          }
+		      
+    			}
+		});
+         
+	});
+	
+	app.post('/api/send-report', function(req, res) {
+		console.log('Report generation is in progress');
+		var response = createRes();
+		var dataset =[];
+		var model = req.body;
+		var reportName = "TimesheetReport-"+model.rMonth.name;
+		var config = getConfig();
+		console.log(model);
+		// lets check if location is blank
+		if(model.locations.length == 0){
+			response.status = 'FAIL';
+			response.err = 'Please select at least one location' ;
+			res.send(response);
+		}
+
+		var month = model.rMonth.id;
+		var year = model.rYear;
+		var response = createTSRes();
+		console.log('laod all the json files');
+		// laod all the json files and filter the data by month and year
+		fs.readdir(basePath , function(err, jsonFiles){
+			if(err){
+				response.status = 'FAIL';
+				response.err = 'error has occured while loading the timesheet' +err;
+				console.log(err);
+				res.send(response);
+			}
+			console.log(jsonFiles);
+			if(jsonFiles == undefined || jsonFiles.length == 0){
+				console.log("no files in the directory :" + basePath);
+				response.status = 'FAIL';
+				response.err = "no files in the directory :" + basePath;
+				res.send(response);
+			}
+			for (var i=0; i<jsonFiles.length; i++) {
+				// read the file one by one and push the data only for selected year and month
+				let empJson = fs.readFileSync(basePath+jsonFiles[i]);
+				var empObj = JSON.parse(empJson);
+				var empTs = empObj.timesheets;
+				if(empTs == undefined || empTs.length ==0){
+					continue;
+				}
+				for(var j=0; j<empTs.length; j++){
+					var ts = empTs[j];
+					if(ts.year == year && ts.month.id == month){
+						var obj = {Emp_Location: '',Emp_OhrId: '', Emp_Name: '',Email_Id: '', Genpact_Working_Days: '', Nomura_Working_Days: ''};
+							obj.Emp_Name = ts.name;
+							obj.Emp_OhrId = ts.ohrId;
+							obj.Email_Id = empObj.empDetails.email;
+							obj.Nomura_Working_Days = ts.clientDays;
+							obj.Genpact_Working_Days = ts.genpactDays;
+							obj.Emp_Location = empObj.empDetails.location;
+							dataset.push(obj);
+					}
+				}
+   			 }
+   			     console.log(dataset);
+   				excel.create(reportName,dataset);
+				//var to 	= config.timesheetTemplate.pmoEmail;
+				//var cc 	= config.timesheetTemplate.cc;
+				//var bcc = config.timesheetTemplate.bcc;
+				var to 	= "mithun.kumar@nomura.com";
+				var cc 	="mithun.kumar@nomura.com";
+				var bcc = "mithun.kumar@nomura.com";
+				var subject = 'Nomura Onsite billing days for '+model.rMonth.name+','+model.rYear;
+				var template = config.timesheetTemplate.reportTemplate;
+				var replaceModel = {};
+				replaceModel['MONTH'] = model.rMonth.name;
+				replaceModel['ADMINNAME'] = config.timesheetTemplate.adminName;
+				replaceModel['PMONAME'] = config.timesheetTemplate.pmoShortName;
+				emailer.sendMailWithAttachment(config.timesheetTemplate.adminAddress,to, cc, bcc, subject, template, replaceModel, reportName);
+   			 	response.status = 'success';
+   			 	res.send(response);
+		});
+
+		
+	});
+
+
+var validateFileName = function(fileName){
+	var date ={
+		year : '',
+		month :''
+	}
+	try{
+		var file = fileName.split('-');
+		var dateFormat =file[1].split('.');
+		var dateSplit =dateFormat[0].split('_');
+		date.year = dateSplit[0];
+		date.month = dateSplit[1];
+		return date;
+	}catch(err){
+		console.log('incorrect name format' +err);
+		throw err;
+	}
+}
+
+	// application -------------------------------------------------------------
+	app.get('*', function(req, res) {
+		res.sendfile('./public/index.html'); // load the single view file (angular will handle the page changes on the front-end)
+		//app.get('/public/index.html', function(req, res){
+
+	//});
+	});
+
+	var createRes = function(){
+		var resp = {
+			ohrId: '',
+			name: '',
+			type: '',
+			active: '',
+			email: '',
+			adminEmail: '',
+			status: '',
+			err: ''
+		};
+		return resp;
+	};
+	var d = {month: '', clientDays: '', genpactDays: ''};
+	var createTSRes = function(){
+		var resp = {
+			ohrId: '',
+			name: '',
+			data: [],
+			status: '',
+			err: ''
+		};
+		return resp;
+	};
+	
+	var getRegData = function(row){
+		return resp = {
+			ohrId: row.OHRID,
+			name: row.NAME,
+			type: '',
+			active: row.ACTIVE,
+			location: row.LOCATION, 
+			team: row.TEAM, 
+			email: row.EMAIL, 
+			contact: row.CONTACT, 
+			role: row.ROLE, 
+			pLang: row.P_LANG, 
+			sLang: row.OTHER_LANG, 
+			tools: row.TOOLS, 
+			domain: row.DOMAIN, 
+			os: row.OS, 
+			startDt: row.ON_BOARD_DATE, 
+			endDt: row.OFF_BOARD_DATE,
+			otherDomains: row.OTHER_DOMAIN,
+			otherRoles: row.OTHER_ROLE,
+			otherTools: row.OTHER_TOOLS,
+			status: '',
+			err: ''
+		};
+	}
+
+	var adminColumns = " OHRID, NAME, PASSWORD, TYPE, ACTIVE, EMAIL "
+	var adminData = {ohrId:'', name:'', email:[]};
+
+	var months ={January:01,February:02,March:03,April:04,May:05,June:06,July:07,August:08,September:09,October:10,November:11,December:12};
+	var RegSelectColumns = " OHRID, NAME, PASSWORD, LOCATION, ACTIVE, TEAM, EMAIL, CONTACT, ROLE, P_LANG, OTHER_LANG, TOOLS, DOMAIN, OS, DATE_FORMAT(ON_BOARD_DATE, '%d-%b-%Y') as ON_BOARD_DATE, DATE_FORMAT(OFF_BOARD_DATE, '%d-%b-%Y') as OFF_BOARD_DATE,OTHER_TOOLS,OTHER_ROLE,OTHER_DOMAIN ";
+	var RegInsertColumns = " OHRID, NAME, PASSWORD, LOCATION, ACTIVE, TEAM, EMAIL, CONTACT, ROLE, P_LANG, OTHER_LANG, TOOLS, DOMAIN, OS, ON_BOARD_DATE, LASTUPDDT,OTHER_TOOLS,OTHER_ROLE,OTHER_DOMAIN  ";
+	var monthName ={01:"January",02:"February",03:"March",04:"April",05:"May",06:"June",07:"July",08:"August",09:"September",10:"October",11:"Novemebr",12:"December"};
+	
+	var TimesheetColumns = " OHRID, NAME, MONTH, CLIENT_WORKING_DAYS, GENPACT_WORKING_DAYS, YEAR, NO_OF_LEAVE, DATE_FORMAT(LASTUPDDT, '%d-%b-%Y') as LASTUPDDT ";
+	var WorkDaysColumns = " MONTH, WORKING_DAYS ";
+};
+
+
+
+
